@@ -148,13 +148,11 @@ checkObject('refuses to send without a URL', unconfigured,
 check('makes no request when unconfigured', unconfiguredRequests.length, 0);
 
 var noTokenRequests = installFakeXhr();
-var noToken;
-context.sendToJoplin('No token', { joplin_url: 'https://joplin.example.com' }, function(ok, data) {
-    noToken = { ok: ok, data: data };
-});
-checkObject('refuses to send without a token', noToken,
-    { ok: false, data: 'Joplin not configured' });
-check('makes no request without a token', noTokenRequests.length, 0);
+context.sendToJoplin('No token', { joplin_url: 'https://joplin.example.com' }, function() {});
+check('sends without a token (header auth or wrapper-managed token)',
+    noTokenRequests.length, 1);
+check('leaves the token out of the URL when none is set',
+    noTokenRequests[0].url, 'https://joplin.example.com/notes');
 
 function failWith(status, body) {
     var r = installFakeXhr();

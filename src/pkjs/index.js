@@ -1463,7 +1463,11 @@ function saveJoplinTagCache(base, ids) {
     catch (e) {}
 }
 
+// The token is optional: some headless Data API wrappers reject a ?token=
+// parameter and expect it in a header (set through the extra headers field)
+// or handle auth themselves, so with no token the URL carries none.
 function joplinUrl(base, path, token) {
+    if (!token) return base + path;
     return base + path + (path.indexOf('?') >= 0 ? '&' : '?') +
            'token=' + encodeURIComponent(token);
 }
@@ -1593,7 +1597,7 @@ function listJoplinFolders(cfg, done) {
 }
 
 function sendToJoplin(text, cfg, cb) {
-    if (!joplinBase(cfg) || !cfg.joplin_token) { cb(false, 'Joplin not configured'); return; }
+    if (!joplinBase(cfg)) { cb(false, 'Joplin not configured'); return; }
 
     var body = {
         title:      text.substring(0, 80),
@@ -2300,7 +2304,7 @@ function openSettings() {
         if (!folders || !folders.length) {
             return '<input type="text" id="joplin_notebook_id" value=\'' +
                    esc(cfg.joplin_notebook_id) + '\' placeholder="notebook id (blank = default)">' +
-                   '<p class="note">Enable Joplin, fill in the URL and token, then save and reopen ' +
+                   '<p class="note">Enable Joplin, fill in the URL (and token if needed), then save and reopen ' +
                    'settings to pick a notebook from a list.</p>';
         }
         // Show each notebook by its full path so same-named children stay apart.
@@ -2570,7 +2574,7 @@ function openSettings() {
     '<p class="note">Needs a Joplin <b>client</b> with the Web Clipper service on (desktop, or the CLI running headless) &mdash; Joplin Server alone has no note API. Use HTTPS: the token travels in the query string.</p>' +
     'API token:<input type="password" id="joplin_token" value=\'' + esc(cfg.joplin_token) + '\'>' +
     extraHeadersField('joplin', 'CF-Access-Client-Id: ...') +
-    '<p class="note">Joplin &rarr; Options &rarr; Web Clipper, or <code>joplin config api.token</code> on the CLI.</p>' +
+    '<p class="note">Joplin &rarr; Options &rarr; Web Clipper, or <code>joplin config api.token</code> on the CLI. Leave blank if your API wrapper takes the token in a header (add it under extra headers) or handles auth itself.</p>' +
     'Notebook:' + joplinNotebookField +
     'Tags (comma-separated, optional, max ' + JOPLIN_MAX_TAGS + '):<input type="text" id="joplin_tags"' +
     ' value=\'' + esc(cfg.joplin_tags) + '\' placeholder="pebble, inbox">' +
@@ -2848,7 +2852,7 @@ function openSettings() {
     // list Joplin's notebooks so the picker can be a real list. Each step is
     // skipped (and its result left empty) when that service isn't set up.
     function withJoplinFolders(notionStatus) {
-        if (!cfg.joplin_enabled || !cfg.joplin_url || !cfg.joplin_token) {
+        if (!cfg.joplin_enabled || !cfg.joplin_url) {
             render(notionStatus, null);
             return;
         }

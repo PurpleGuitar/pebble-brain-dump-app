@@ -250,6 +250,25 @@ check('the notebook probe behind the settings picker sends them',
 check('the probe still asks for the first page',
     probeRequests[0].url, 'https://joplin.example.com/folders?page=1&token=tok');
 
+// A Data API wrapper that wants the token in a header, not the query string.
+var headerTokenRequests = installFakeXhr();
+context.sendToJoplin('note', {
+    joplin_url: 'https://joplin.example.com', joplin_headers: 'Authorization: tok'
+}, function() {});
+check('a header-only token reaches Joplin',
+    headersOf(headerTokenRequests[0])['Authorization'], 'tok');
+check('with no token set, the URL carries none',
+    headerTokenRequests[0].url, 'https://joplin.example.com/notes');
+
+storage.brain_dump_cfg_v1 = JSON.stringify({
+    joplin_enabled: true, joplin_url: 'https://joplin.example.com',
+    joplin_headers: 'Authorization: tok'
+});
+var headerProbeRequests = installFakeXhr();
+context.openSettings();
+check('the notebook probe runs without a token',
+    headerProbeRequests[0].url, 'https://joplin.example.com/folders?page=1');
+
 // ---------------------------------------------------------------------------
 section('Settings page');
 var savedCfg = {
