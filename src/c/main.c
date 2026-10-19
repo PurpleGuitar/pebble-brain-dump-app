@@ -249,7 +249,7 @@ static PreferredContentSize s_csize = PreferredContentSizeMedium;
 
 static void home_window_push(void);
 static void confirm_window_push(void);
-static void confirm_relayout_meta(GRect b, int content_w);
+static void confirm_relayout_meta(GRect b);
 static void response_window_push(void);
 static void history_window_push(void);
 static void detail_window_push(int idx);
@@ -813,7 +813,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
             }
             if (s_confirm_window) {
                 Layer *root = window_get_root_layer(s_confirm_window);
-                confirm_relayout_meta(layer_get_bounds(root), content_area_w(layer_get_bounds(root)) - 8);
+                confirm_relayout_meta(layer_get_bounds(root));
             }
         } else {
             if (dest == DEST_AI) {
@@ -1190,23 +1190,42 @@ static void draw_dest_tile(GContext *ctx, int dest, GPoint center, int size, GCo
 #define CONFIRM_DUE_H      (app_font_h(AF_FOOTER))
 #define CONFIRM_META_GAP   2
 
-static void confirm_relayout_meta(GRect b, int content_w) {
+// Round: the display's corners fall away, so the text sits in a column centered
+// on the screen (as wide as the gap left of the action bar on each side), and
+// the destination lines are lifted clear of the bottom curve. Rect keeps the
+// left-aligned column filling the area left of the action bar.
+#ifdef PBL_ROUND
+#  define CONFIRM_TEXT_ALIGN GTextAlignmentCenter
+static int confirm_meta_bottom_pad(GRect b) { return b.size.h * 14 / 100; }
+static GRect confirm_column(GRect b, int y, int h) {
+    return GRect(ACTION_BAR_W, y, b.size.w - 2 * ACTION_BAR_W, h);
+}
+#else
+#  define CONFIRM_TEXT_ALIGN GTextAlignmentLeft
+static int confirm_meta_bottom_pad(GRect b) { return CONFIRM_BOTTOM_PAD; }
+static GRect confirm_column(GRect b, int y, int h) {
+    return GRect(4, y, content_area_w(b) - 8, h);
+}
+#endif
+
+static void confirm_relayout_meta(GRect b) {
     if (!s_confirm_target_layer || !s_confirm_content_layer) return;
 
     bool has_due = s_confirm_due_buf[0] != '\0';
-    int due_y = b.size.h - CONFIRM_BOTTOM_PAD - CONFIRM_DUE_H;
+    int meta_bottom = b.size.h - confirm_meta_bottom_pad(b);
+    int due_y = meta_bottom - CONFIRM_DUE_H;
     int target_y = has_due
         ? (due_y - CONFIRM_META_GAP - CONFIRM_TARGET_H)
-        : (b.size.h - CONFIRM_BOTTOM_PAD - CONFIRM_TARGET_H);
+        : (meta_bottom - CONFIRM_TARGET_H);
     int content_bottom = target_y - 4;
 
     layer_set_frame(text_layer_get_layer(s_confirm_target_layer),
-                    GRect(4, target_y, content_w, CONFIRM_TARGET_H));
+                    confirm_column(b, target_y, CONFIRM_TARGET_H));
     layer_set_frame(text_layer_get_layer(s_confirm_due_layer),
-                    GRect(4, due_y, content_w, CONFIRM_DUE_H));
+                    confirm_column(b, due_y, CONFIRM_DUE_H));
     layer_set_hidden(text_layer_get_layer(s_confirm_due_layer), !has_due);
     layer_set_frame(text_layer_get_layer(s_confirm_content_layer),
-                    GRect(4, STATUS_H + 4, content_w, content_bottom - (STATUS_H + 4)));
+                    confirm_column(b, STATUS_H + 4, content_bottom - (STATUS_H + 4)));
 }
 
 static void confirm_canvas_update(Layer *layer, GContext *ctx) {
@@ -1260,14 +1279,18 @@ static void confirm_window_load(Window *window) {
 
     window_set_background_color(window, C_SCREEN);
 
-    int content_w = content_area_w(b) - 8;
-
     s_confirm_canvas_layer = layer_create(b);
     layer_set_update_proc(s_confirm_canvas_layer, confirm_canvas_update);
     layer_add_child(root, s_confirm_canvas_layer);
 
+    // Status bar. Round: centered title (as on home). Rect: left title.
+#ifdef PBL_ROUND
+    s_confirm_title_layer = text_layer_create(GRect(0, 1, b.size.w, STATUS_H));
+    text_layer_set_text_alignment(s_confirm_title_layer, GTextAlignmentCenter);
+#else
     s_confirm_title_layer = text_layer_create(
         GRect(STATUS_TITLE_X, 1, STATUS_HDR_TITLE_W(content_area_w(b)), STATUS_H));
+#endif
     text_layer_set_background_color(s_confirm_title_layer, GColorClear);
     text_layer_set_text_color(s_confirm_title_layer, C_ON_SCREEN);
     text_layer_set_font(s_confirm_title_layer, app_font(AF_STATUS));
@@ -1277,30 +1300,39 @@ static void confirm_window_load(Window *window) {
     s_confirm_divider_layer = add_status_divider_layer(root, b.size.w);
 
     s_confirm_content_layer = text_layer_create(
-        GRect(4, STATUS_H + 4, content_w, b.size.h - STATUS_H - 8));
+        confirm_column(b, STATUS_H + 4, b.size.h - STATUS_H - 8));
     text_layer_set_background_color(s_confirm_content_layer, GColorClear);
     text_layer_set_text_color(s_confirm_content_layer, C_ON_SCREEN);
     text_layer_set_font(s_confirm_content_layer, app_font(AF_BODY));
     text_layer_set_overflow_mode(s_confirm_content_layer, GTextOverflowModeWordWrap);
+    text_layer_set_text_alignment(s_confirm_content_layer, CONFIRM_TEXT_ALIGN);
     text_layer_set_text(s_confirm_content_layer, s_note_buf);
     layer_add_child(root, text_layer_get_layer(s_confirm_content_layer));
+#ifdef PBL_ROUND
+    // Wrap each line inside the circle so the top/bottom lines aren't clipped;
+    // a note too long for the space ends in an ellipsis, not a half-cut line.
+    text_layer_set_overflow_mode(s_confirm_content_layer, GTextOverflowModeTrailingEllipsis);
+    text_layer_enable_screen_text_flow_and_paging(s_confirm_content_layer, 4);
+#endif
 
     // Destination ("→ Google Tasks") + any extracted due date/time below it.
     snprintf(s_confirm_target_buf, sizeof(s_confirm_target_buf), "\xe2\x86\x92 ?");
     s_confirm_target_layer = text_layer_create(
-        GRect(4, b.size.h - CONFIRM_BOTTOM_PAD - CONFIRM_TARGET_H, content_w, CONFIRM_TARGET_H));
+        confirm_column(b, b.size.h - confirm_meta_bottom_pad(b) - CONFIRM_TARGET_H, CONFIRM_TARGET_H));
     text_layer_set_background_color(s_confirm_target_layer, GColorClear);
     text_layer_set_text_color(s_confirm_target_layer, C_ON_SCREEN);
     text_layer_set_font(s_confirm_target_layer, app_font(AF_HEADER));
+    text_layer_set_text_alignment(s_confirm_target_layer, CONFIRM_TEXT_ALIGN);
     text_layer_set_text(s_confirm_target_layer, s_confirm_target_buf);
     layer_add_child(root, text_layer_get_layer(s_confirm_target_layer));
 
     s_confirm_due_buf[0] = '\0';
     s_confirm_due_layer = text_layer_create(
-        GRect(4, b.size.h - CONFIRM_BOTTOM_PAD - CONFIRM_DUE_H, content_w, CONFIRM_DUE_H));
+        confirm_column(b, b.size.h - confirm_meta_bottom_pad(b) - CONFIRM_DUE_H, CONFIRM_DUE_H));
     text_layer_set_background_color(s_confirm_due_layer, GColorClear);
     text_layer_set_text_color(s_confirm_due_layer, GColorLightGray);
     text_layer_set_font(s_confirm_due_layer, app_font(AF_FOOTER));
+    text_layer_set_text_alignment(s_confirm_due_layer, CONFIRM_TEXT_ALIGN);
     text_layer_set_text(s_confirm_due_layer, s_confirm_due_buf);
     layer_add_child(root, text_layer_get_layer(s_confirm_due_layer));
 
@@ -1319,7 +1351,7 @@ static void confirm_window_load(Window *window) {
     text_layer_set_text(s_confirm_due_layer, s_confirm_due_buf);
 #endif
 
-    confirm_relayout_meta(b, content_w);
+    confirm_relayout_meta(b);
 
     window_set_click_config_provider(window, confirm_click_config);
     s_confirm_open = true;
