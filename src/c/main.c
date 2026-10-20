@@ -152,6 +152,7 @@ static char    s_fallback_err[STATUS_BUF_SIZE];
 static Layer     *s_confirm_canvas_layer;
 static Layer     *s_confirm_divider_layer;
 static TextLayer *s_confirm_title_layer;
+static ScrollLayer *s_confirm_scroll_layer;
 static TextLayer *s_confirm_content_layer;
 static TextLayer *s_confirm_target_layer;
 static TextLayer *s_confirm_due_layer;
@@ -217,6 +218,8 @@ static bool    s_cfg_quick_skip_confirm = false;      // route without the revie
 static bool    s_cfg_quick_auto_exit    = true;       // exit once the note is saved (default on)
 static int16_t s_resp_scroll_offset  = 0;
 static int16_t s_detail_scroll_offset = 0;
+static int16_t s_confirm_scroll_offset = 0;
+static AppTimer *s_confirm_redo_guard = NULL;  // UP can't redo while this runs
 
 // --- History ---
 static int      s_history_count = 0;
@@ -249,7 +252,7 @@ static PreferredContentSize s_csize = PreferredContentSizeMedium;
 
 static void home_window_push(void);
 static void confirm_window_push(void);
-static void confirm_relayout_meta(GRect b, int content_w);
+static void confirm_relayout_meta(GRect b);
 static void response_window_push(void);
 static void history_window_push(void);
 static void detail_window_push(int idx);
@@ -813,7 +816,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
             }
             if (s_confirm_window) {
                 Layer *root = window_get_root_layer(s_confirm_window);
-                confirm_relayout_meta(layer_get_bounds(root), content_area_w(layer_get_bounds(root)) - 8);
+                confirm_relayout_meta(layer_get_bounds(root));
             }
         } else {
             if (dest == DEST_AI) {
@@ -1184,29 +1187,100 @@ static void draw_dest_tile(GContext *ctx, int dest, GPoint center, int size, GCo
 // CONFIRM WINDOW  (review transcription + target before routing)
 // ============================================================================
 
+// Scroll distance per UP/DOWN press, shared by every scrolling screen.
+#define RESP_SCROLL_STEP 36
+
 #define CONFIRM_HINT_W ACTION_BAR_W
 #define CONFIRM_BOTTOM_PAD 4
 #define CONFIRM_TARGET_H   (app_font_h(AF_HEADER))
 #define CONFIRM_DUE_H      (app_font_h(AF_FOOTER))
 #define CONFIRM_META_GAP   2
 
-static void confirm_relayout_meta(GRect b, int content_w) {
-    if (!s_confirm_target_layer || !s_confirm_content_layer) return;
+// Round: the display's corners fall away, so the text sits in a column centered
+// on the screen (as wide as the gap left of the action bar on each side), and
+// the destination lines are lifted clear of the bottom curve. Rect keeps the
+// left-aligned column filling the area left of the action bar.
+#ifdef PBL_ROUND
+#  define CONFIRM_TEXT_ALIGN GTextAlignmentCenter
+static int confirm_meta_bottom_pad(GRect b) { return b.size.h * 14 / 100; }
+static GRect confirm_column(GRect b, int y, int h) {
+    return GRect(ACTION_BAR_W, y, b.size.w - 2 * ACTION_BAR_W, h);
+}
+#else
+#  define CONFIRM_TEXT_ALIGN GTextAlignmentLeft
+static int confirm_meta_bottom_pad(GRect b) { return CONFIRM_BOTTOM_PAD; }
+static GRect confirm_column(GRect b, int y, int h) {
+    return GRect(4, y, content_area_w(b) - 8, h);
+}
+#endif
+
+// The note's scrolling view, y..y+h. Round narrows it to a column that stays
+// inside the circle along its whole height (the row farthest from the center
+// sets the width), clear of the action bar.
+static GRect confirm_note_frame(GRect b, int y, int h) {
+#ifdef PBL_ROUND
+    int r = b.size.w / 2, cy = b.size.h / 2;
+    int dy_top = cy - y, dy_bottom = y + h - cy;
+    int dy = (dy_top > dy_bottom) ? dy_top : dy_bottom;
+    int half = 0;
+    while ((half + 1) * (half + 1) <= r * r - dy * dy) half++;   // isqrt
+    half -= 4;
+    int max_half = action_bar_x(b) - r;
+    if (half > max_half) half = max_half;
+    return GRect(r - half, y, 2 * half, h);
+#else
+    return confirm_column(b, y, h);
+#endif
+}
+
+static int16_t confirm_max_scroll(void) {
+    GSize cs = scroll_layer_get_content_size(s_confirm_scroll_layer);
+    GRect fr = layer_get_frame(scroll_layer_get_layer(s_confirm_scroll_layer));
+    int16_t max_scroll = cs.h - fr.size.h;
+    return (max_scroll < 0) ? 0 : max_scroll;
+}
+
+// Clamp to the scrollable range and redraw the action bar, whose UP icon
+// depends on whether the note is scrolled.
+static void confirm_scroll_to(int16_t offset, bool animated) {
+    int16_t max_scroll = confirm_max_scroll();
+    if (offset > max_scroll) offset = max_scroll;
+    if (offset < 0) offset = 0;
+    s_confirm_scroll_offset = offset;
+    scroll_layer_set_content_offset(s_confirm_scroll_layer, GPoint(0, -offset), animated);
+    if (s_confirm_canvas_layer) layer_mark_dirty(s_confirm_canvas_layer);
+}
+
+static void confirm_relayout_meta(GRect b) {
+    if (!s_confirm_target_layer || !s_confirm_scroll_layer) return;
 
     bool has_due = s_confirm_due_buf[0] != '\0';
-    int due_y = b.size.h - CONFIRM_BOTTOM_PAD - CONFIRM_DUE_H;
+    int meta_bottom = b.size.h - confirm_meta_bottom_pad(b);
+    int due_y = meta_bottom - CONFIRM_DUE_H;
     int target_y = has_due
         ? (due_y - CONFIRM_META_GAP - CONFIRM_TARGET_H)
-        : (b.size.h - CONFIRM_BOTTOM_PAD - CONFIRM_TARGET_H);
+        : (meta_bottom - CONFIRM_TARGET_H);
     int content_bottom = target_y - 4;
 
     layer_set_frame(text_layer_get_layer(s_confirm_target_layer),
-                    GRect(4, target_y, content_w, CONFIRM_TARGET_H));
+                    confirm_column(b, target_y, CONFIRM_TARGET_H));
     layer_set_frame(text_layer_get_layer(s_confirm_due_layer),
-                    GRect(4, due_y, content_w, CONFIRM_DUE_H));
+                    confirm_column(b, due_y, CONFIRM_DUE_H));
     layer_set_hidden(text_layer_get_layer(s_confirm_due_layer), !has_due);
+
+    // The note view fills the space between the title and the meta lines; on
+    // round its width depends on that height, so re-wrap and re-measure.
+    GRect note = confirm_note_frame(b, STATUS_H + 4, content_bottom - (STATUS_H + 4));
+    layer_set_frame(scroll_layer_get_layer(s_confirm_scroll_layer), note);
     layer_set_frame(text_layer_get_layer(s_confirm_content_layer),
-                    GRect(4, STATUS_H + 4, content_w, content_bottom - (STATUS_H + 4)));
+                    GRect(0, 0, note.size.w, 2000));
+    // Measured directly: once drawn, the TextLayer reports only the clipped part.
+    GSize text_size = graphics_text_layout_get_content_size(s_note_buf,
+        app_font(AF_BODY), GRect(0, 0, note.size.w, 2000),
+        GTextOverflowModeWordWrap, CONFIRM_TEXT_ALIGN);
+    scroll_layer_set_content_size(s_confirm_scroll_layer,
+        GSize(note.size.w, text_size.h + 4));
+    confirm_scroll_to(s_confirm_scroll_offset, false);   // a taller meta shrinks the view
 }
 
 static void confirm_canvas_update(Layer *layer, GContext *ctx) {
@@ -1217,8 +1291,13 @@ static void confirm_canvas_update(Layer *layer, GContext *ctx) {
 #ifndef PBL_ROUND
     draw_status_clock_on_bar(ctx, bounds);
 #endif
+    // UP redoes the dictation only with the note scrolled to the top; below
+    // that it scrolls up, so the redo icon shows only at the top. Scrolling
+    // itself gets no icons, like the other scrolling screens.
     int ax = action_bar_icon_x(bounds);
-    draw_icon_redo_review(ctx, GPoint(ax, btn_up_y(bounds)), ACTION_ICON_COLOR);
+    if (s_confirm_scroll_offset == 0) {
+        draw_icon_redo_review(ctx, GPoint(ax, btn_up_y(bounds)), ACTION_ICON_COLOR);
+    }
     draw_icon_checkmark(ctx, GPoint(ax, btn_select_y(bounds)), ACTION_ICON_COLOR);
 }
 
@@ -1244,14 +1323,37 @@ static void confirm_select_click(ClickRecognizerRef rec, void *ctx) {
     app_timer_register(50, confirm_route_cb, NULL);
 }
 
+// After UP scrolls back to the top, the next UP would redo the dictation (and
+// drop this transcript), so a quick extra press while scrolling up is ignored.
+#define CONFIRM_REDO_GUARD_MS 500
+
+static void confirm_redo_guard_cb(void *ctx) {
+    s_confirm_redo_guard = NULL;
+}
+
 static void confirm_up_click(ClickRecognizerRef rec, void *ctx) {
+    if (s_confirm_scroll_offset > 0) {
+        confirm_scroll_to(s_confirm_scroll_offset - RESP_SCROLL_STEP, true);
+        if (s_confirm_scroll_offset == 0) {
+            if (s_confirm_redo_guard) app_timer_cancel(s_confirm_redo_guard);
+            s_confirm_redo_guard = app_timer_register(CONFIRM_REDO_GUARD_MS,
+                                                      confirm_redo_guard_cb, NULL);
+        }
+        return;
+    }
+    if (s_confirm_redo_guard) return;
     window_stack_pop(true);
     app_timer_register(300, confirm_redo_cb, NULL);
+}
+
+static void confirm_down_click(ClickRecognizerRef rec, void *ctx) {
+    confirm_scroll_to(s_confirm_scroll_offset + RESP_SCROLL_STEP, true);
 }
 
 static void confirm_click_config(void *ctx) {
     window_single_click_subscribe(BUTTON_ID_SELECT, confirm_select_click);
     window_single_click_subscribe(BUTTON_ID_UP,     confirm_up_click);
+    window_single_click_subscribe(BUTTON_ID_DOWN,   confirm_down_click);
 }
 
 static void confirm_window_load(Window *window) {
@@ -1260,14 +1362,18 @@ static void confirm_window_load(Window *window) {
 
     window_set_background_color(window, C_SCREEN);
 
-    int content_w = content_area_w(b) - 8;
-
     s_confirm_canvas_layer = layer_create(b);
     layer_set_update_proc(s_confirm_canvas_layer, confirm_canvas_update);
     layer_add_child(root, s_confirm_canvas_layer);
 
+    // Status bar. Round: centered title (as on home). Rect: left title.
+#ifdef PBL_ROUND
+    s_confirm_title_layer = text_layer_create(GRect(0, 1, b.size.w, STATUS_H));
+    text_layer_set_text_alignment(s_confirm_title_layer, GTextAlignmentCenter);
+#else
     s_confirm_title_layer = text_layer_create(
         GRect(STATUS_TITLE_X, 1, STATUS_HDR_TITLE_W(content_area_w(b)), STATUS_H));
+#endif
     text_layer_set_background_color(s_confirm_title_layer, GColorClear);
     text_layer_set_text_color(s_confirm_title_layer, C_ON_SCREEN);
     text_layer_set_font(s_confirm_title_layer, app_font(AF_STATUS));
@@ -1276,31 +1382,41 @@ static void confirm_window_load(Window *window) {
 
     s_confirm_divider_layer = add_status_divider_layer(root, b.size.w);
 
-    s_confirm_content_layer = text_layer_create(
-        GRect(4, STATUS_H + 4, content_w, b.size.h - STATUS_H - 8));
+    // The note scrolls (UP/DOWN) between the title and the pinned destination
+    // lines; confirm_relayout_meta() sizes the view once those are placed.
+    GRect note_frame = confirm_note_frame(b, STATUS_H + 4, b.size.h - STATUS_H - 8);
+    s_confirm_scroll_offset = 0;
+    s_confirm_scroll_layer = scroll_layer_create(note_frame);
+    scroll_layer_set_shadow_hidden(s_confirm_scroll_layer, true);
+    layer_add_child(root, scroll_layer_get_layer(s_confirm_scroll_layer));
+
+    s_confirm_content_layer = text_layer_create(GRect(0, 0, note_frame.size.w, 2000));
     text_layer_set_background_color(s_confirm_content_layer, GColorClear);
     text_layer_set_text_color(s_confirm_content_layer, C_ON_SCREEN);
     text_layer_set_font(s_confirm_content_layer, app_font(AF_BODY));
     text_layer_set_overflow_mode(s_confirm_content_layer, GTextOverflowModeWordWrap);
+    text_layer_set_text_alignment(s_confirm_content_layer, CONFIRM_TEXT_ALIGN);
     text_layer_set_text(s_confirm_content_layer, s_note_buf);
-    layer_add_child(root, text_layer_get_layer(s_confirm_content_layer));
+    scroll_layer_add_child(s_confirm_scroll_layer, text_layer_get_layer(s_confirm_content_layer));
 
     // Destination ("→ Google Tasks") + any extracted due date/time below it.
     snprintf(s_confirm_target_buf, sizeof(s_confirm_target_buf), "\xe2\x86\x92 ?");
     s_confirm_target_layer = text_layer_create(
-        GRect(4, b.size.h - CONFIRM_BOTTOM_PAD - CONFIRM_TARGET_H, content_w, CONFIRM_TARGET_H));
+        confirm_column(b, b.size.h - confirm_meta_bottom_pad(b) - CONFIRM_TARGET_H, CONFIRM_TARGET_H));
     text_layer_set_background_color(s_confirm_target_layer, GColorClear);
     text_layer_set_text_color(s_confirm_target_layer, C_ON_SCREEN);
     text_layer_set_font(s_confirm_target_layer, app_font(AF_HEADER));
+    text_layer_set_text_alignment(s_confirm_target_layer, CONFIRM_TEXT_ALIGN);
     text_layer_set_text(s_confirm_target_layer, s_confirm_target_buf);
     layer_add_child(root, text_layer_get_layer(s_confirm_target_layer));
 
     s_confirm_due_buf[0] = '\0';
     s_confirm_due_layer = text_layer_create(
-        GRect(4, b.size.h - CONFIRM_BOTTOM_PAD - CONFIRM_DUE_H, content_w, CONFIRM_DUE_H));
+        confirm_column(b, b.size.h - confirm_meta_bottom_pad(b) - CONFIRM_DUE_H, CONFIRM_DUE_H));
     text_layer_set_background_color(s_confirm_due_layer, GColorClear);
     text_layer_set_text_color(s_confirm_due_layer, GColorLightGray);
     text_layer_set_font(s_confirm_due_layer, app_font(AF_FOOTER));
+    text_layer_set_text_alignment(s_confirm_due_layer, CONFIRM_TEXT_ALIGN);
     text_layer_set_text(s_confirm_due_layer, s_confirm_due_buf);
     layer_add_child(root, text_layer_get_layer(s_confirm_due_layer));
 
@@ -1319,7 +1435,7 @@ static void confirm_window_load(Window *window) {
     text_layer_set_text(s_confirm_due_layer, s_confirm_due_buf);
 #endif
 
-    confirm_relayout_meta(b, content_w);
+    confirm_relayout_meta(b);
 
     window_set_click_config_provider(window, confirm_click_config);
     s_confirm_open = true;
@@ -1330,6 +1446,8 @@ static void confirm_window_unload(Window *window) {
     layer_destroy(s_confirm_divider_layer);    s_confirm_divider_layer = NULL;
     text_layer_destroy(s_confirm_title_layer); s_confirm_title_layer = NULL;
     text_layer_destroy(s_confirm_content_layer); s_confirm_content_layer = NULL;
+    scroll_layer_destroy(s_confirm_scroll_layer); s_confirm_scroll_layer = NULL;
+    if (s_confirm_redo_guard) { app_timer_cancel(s_confirm_redo_guard); s_confirm_redo_guard = NULL; }
     text_layer_destroy(s_confirm_target_layer);  s_confirm_target_layer  = NULL;
     text_layer_destroy(s_confirm_due_layer);     s_confirm_due_layer     = NULL;
     s_confirm_open = false;
@@ -1760,8 +1878,6 @@ static void home_window_unload(Window *window) {
 // ============================================================================
 // RESPONSE WINDOW  (AI replies)
 // ============================================================================
-
-#define RESP_SCROLL_STEP 36
 
 static void resp_up_click(ClickRecognizerRef rec, void *ctx) {
     s_resp_scroll_offset -= RESP_SCROLL_STEP;
