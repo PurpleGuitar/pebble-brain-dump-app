@@ -9,7 +9,9 @@
 // CONSTANTS
 // ============================================================================
 
-#define NOTE_BUF_SIZE      400
+#define NOTE_BUF_SIZE      1000  // a note can be several dictations added together
+#define DICTATION_BUF_SIZE 500   // one dictation; the firmware caps a transcript at 500
+#define AI_RESPONSE_BUF_SIZE 400
 #define STATUS_BUF_SIZE     48
 #define CONV_BUF_SIZE     1200
 #define MAX_HISTORY          8
@@ -156,7 +158,10 @@ static ScrollLayer *s_confirm_scroll_layer;
 static TextLayer *s_confirm_content_layer;
 static TextLayer *s_confirm_target_layer;
 static TextLayer *s_confirm_due_layer;
+static TextLayer *s_confirm_hint_layer;
 static bool       s_confirm_is_followup;
+static bool       s_confirm_scroll_mode = false;  // UP/DOWN scroll the note
+static bool       s_confirm_overflows   = false;  // note taller than its view
 static bool       s_confirm_open      = false;
 static char       s_confirm_target_buf[32];
 static char       s_confirm_due_buf[32];
@@ -200,7 +205,7 @@ static DictationSession *s_dictation_session;
 
 // --- Buffers ---
 static char s_note_buf[NOTE_BUF_SIZE];
-static char s_ai_response_buf[NOTE_BUF_SIZE];
+static char s_ai_response_buf[AI_RESPONSE_BUF_SIZE];
 static char s_status_buf[STATUS_BUF_SIZE];
 static char s_webhook_msg_buf[120];   // two-way webhook reply shown on success screen
 static char s_conversation_buf[CONV_BUF_SIZE];
@@ -218,8 +223,7 @@ static bool    s_cfg_quick_skip_confirm = false;      // route without the revie
 static bool    s_cfg_quick_auto_exit    = true;       // exit once the note is saved (default on)
 static int16_t s_resp_scroll_offset  = 0;
 static int16_t s_detail_scroll_offset = 0;
-static int16_t s_confirm_scroll_offset = 0;
-static AppTimer *s_confirm_redo_guard = NULL;  // UP can't redo while this runs
+static bool    s_dictation_adds      = false;   // next dictation appends to s_note_buf
 
 // --- History ---
 static int      s_history_count = 0;
@@ -370,6 +374,7 @@ static int btn_y_at(GRect bounds, int pct) {
 #endif
 static int btn_up_y(GRect b)     { return b.size.h * BTN_UP_PCT / 100; }
 static int btn_select_y(GRect b) { return b.size.h / 2; }
+static int btn_down_y(GRect b)   { return b.size.h - btn_up_y(b); }
 
 // "Destination · <when>": time only if today, date + time if an earlier day.
 static void format_relative_meta(uint32_t ts, int dest, char *buf, size_t len) {
@@ -872,8 +877,8 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     // AI_RESPONSE — show on response window
     Tuple *ai_t = dict_find(iter, MESSAGE_KEY_AI_RESPONSE);
     if (ai_t) {
-        strncpy(s_ai_response_buf, ai_t->value->cstring, NOTE_BUF_SIZE - 1);
-        s_ai_response_buf[NOTE_BUF_SIZE - 1] = '\0';
+        strncpy(s_ai_response_buf, ai_t->value->cstring, AI_RESPONSE_BUF_SIZE - 1);
+        s_ai_response_buf[AI_RESPONSE_BUF_SIZE - 1] = '\0';
     }
 
     Tuple *done_t = dict_find(iter, MESSAGE_KEY_AI_RESPONSE_DONE);
@@ -916,6 +921,22 @@ static void dictation_callback(DictationSession *session,
                                 char *transcription, void *context) {
     bool is_followup = s_is_followup;
     s_is_followup = false;   // consume flag
+    bool adds = s_dictation_adds;
+    s_dictation_adds = false;
+
+    // Adding to a note (DOWN on the review screen): whatever happened, go back
+    // to the review screen, with the new words appended on success. A failed or
+    // cancelled add must never lose the note already there.
+    if (adds) {
+        if (status == DictationSessionStatusSuccess && transcription[0]) {
+            size_t len = strlen(s_note_buf);
+            snprintf(s_note_buf + len, NOTE_BUF_SIZE - len, "%s%s",
+                     len ? " " : "", transcription);
+        }
+        s_confirm_is_followup = is_followup;
+        confirm_window_push();
+        return;
+    }
 
     if (status == DictationSessionStatusSuccess) {
         strncpy(s_note_buf, transcription, NOTE_BUF_SIZE - 1);
@@ -1104,6 +1125,33 @@ static void draw_icon_trash(GContext *ctx, GPoint c, GColor color) {
     graphics_fill_rect(ctx, GRect(c.x - 5, c.y - 4, 10, 11), 0, GCornerNone);
 }
 
+// Add more: the record disk, nudged down-right, with a "+" at its top left.
+static void draw_icon_add_record(GContext *ctx, GPoint c, GColor color) {
+    graphics_context_set_fill_color(ctx, color);
+    graphics_fill_circle(ctx, GPoint(c.x + 2, c.y + 2), 6);
+    graphics_context_set_stroke_color(ctx, color);
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_draw_line(ctx, GPoint(c.x - 10, c.y - 6), GPoint(c.x - 4, c.y - 6));
+    graphics_draw_line(ctx, GPoint(c.x - 7, c.y - 9), GPoint(c.x - 7, c.y - 3));
+}
+
+// Chevron pointing up or down — scroll buttons in a scroll mode.
+static void draw_icon_chevron(GContext *ctx, GPoint c, bool up, GColor color) {
+    int d = up ? -3 : 3;
+    graphics_context_set_stroke_color(ctx, color);
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_draw_line(ctx, GPoint(c.x - 6, c.y - d), GPoint(c.x, c.y + d));
+    graphics_draw_line(ctx, GPoint(c.x, c.y + d),     GPoint(c.x + 6, c.y - d));
+}
+
+// Cross — leave a mode.
+static void draw_icon_close(GContext *ctx, GPoint c, GColor color) {
+    graphics_context_set_stroke_color(ctx, color);
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_draw_line(ctx, GPoint(c.x - 5, c.y - 5), GPoint(c.x + 5, c.y + 5));
+    graphics_draw_line(ctx, GPoint(c.x - 5, c.y + 5), GPoint(c.x + 5, c.y - 5));
+}
+
 // Checkmark — confirm / accept affordance.
 static void draw_icon_checkmark(GContext *ctx, GPoint c, GColor color) {
     graphics_context_set_stroke_color(ctx, color);
@@ -1190,7 +1238,7 @@ static void draw_dest_tile(GContext *ctx, int dest, GPoint center, int size, GCo
 // Scroll distance per UP/DOWN press, shared by every scrolling screen.
 #define RESP_SCROLL_STEP 36
 
-#define CONFIRM_HINT_W ACTION_BAR_W
+#define CONFIRM_HINT_H     (app_font_h(AF_FOOTER))
 #define CONFIRM_BOTTOM_PAD 4
 #define CONFIRM_TARGET_H   (app_font_h(AF_HEADER))
 #define CONFIRM_DUE_H      (app_font_h(AF_FOOTER))
@@ -1253,11 +1301,43 @@ static void confirm_relayout_meta(GRect b) {
     // The note view fills the space between the title and the meta lines. A
     // taller meta shrinks it, so re-measure and go back to the top. Measured
     // directly: once drawn, the TextLayer reports only the clipped part.
-    GRect note = confirm_column(b, STATUS_H + 4, content_bottom - (STATUS_H + 4));
+    // A note taller than the view also gets the scroll hint above the meta,
+    // which takes a line from the view.
+    int note_top = STATUS_H + 4;
+    GRect note = confirm_column(b, note_top, content_bottom - note_top);
+    int16_t text_h = confirm_note_text_h(note);
+    s_confirm_overflows = text_h > note.size.h;
+    if (s_confirm_overflows) {
+        int hint_y = content_bottom - CONFIRM_HINT_H;
+        layer_set_frame(text_layer_get_layer(s_confirm_hint_layer),
+                        confirm_column(b, hint_y, CONFIRM_HINT_H));
+        note = confirm_column(b, note_top, hint_y - 2 - note_top);
+        text_h = confirm_note_text_h(note);
+    }
+    layer_set_hidden(text_layer_get_layer(s_confirm_hint_layer), !s_confirm_overflows);
+    if (!s_confirm_overflows) s_confirm_scroll_mode = false;
+
     layer_set_frame(scroll_layer_get_layer(s_confirm_scroll_layer), note);
-    scroll_layer_set_content_size(s_confirm_scroll_layer,
-        GSize(note.size.w, confirm_note_text_h(note) + 4));
+    scroll_layer_set_content_size(s_confirm_scroll_layer, GSize(note.size.w, text_h + 4));
     scroll_layer_set_content_offset(s_confirm_scroll_layer, GPointZero, false);
+}
+
+// The scroll hint, in full when it fits on one line of the hint's width (the
+// small round screen gets the short form).
+static const char *confirm_hint_text(bool scroll_mode) {
+    const char *full  = scroll_mode ? "SELECT to stop scrolling" : "Hold SELECT to scroll";
+    const char *brief = scroll_mode ? "SELECT: stop" : "Hold SELECT: scroll";
+    GRect fr = layer_get_frame(text_layer_get_layer(s_confirm_hint_layer));
+    int h = graphics_text_layout_get_content_size(full, app_font(AF_FOOTER),
+        GRect(0, 0, fr.size.w, 200), GTextOverflowModeWordWrap, CONFIRM_TEXT_ALIGN).h;
+    return (h > CONFIRM_HINT_H) ? brief : full;
+}
+
+// Scroll mode (hold SELECT) turns UP/DOWN into scrolling; SELECT leaves it.
+static void confirm_set_scroll_mode(bool on) {
+    s_confirm_scroll_mode = on;
+    text_layer_set_text(s_confirm_hint_layer, confirm_hint_text(on));
+    if (s_confirm_canvas_layer) layer_mark_dirty(s_confirm_canvas_layer);
 }
 
 static void confirm_canvas_update(Layer *layer, GContext *ctx) {
@@ -1268,14 +1348,18 @@ static void confirm_canvas_update(Layer *layer, GContext *ctx) {
 #ifndef PBL_ROUND
     draw_status_clock_on_bar(ctx, bounds);
 #endif
-    // UP redoes the dictation only with the note scrolled to the top; below
-    // that it scrolls up, so the redo icon shows only at the top. Scrolling
-    // itself gets no icons, like the other scrolling screens.
+    // UP redo, SELECT send, DOWN add more; in scroll mode UP/DOWN scroll and
+    // SELECT closes the mode, so the icons say so.
     int ax = action_bar_icon_x(bounds);
-    if (s_confirm_scroll_offset == 0) {
+    if (s_confirm_scroll_mode) {
+        draw_icon_chevron(ctx, GPoint(ax, btn_up_y(bounds)), true, ACTION_ICON_COLOR);
+        draw_icon_close(ctx, GPoint(ax, btn_select_y(bounds)), ACTION_ICON_COLOR);
+        draw_icon_chevron(ctx, GPoint(ax, btn_down_y(bounds)), false, ACTION_ICON_COLOR);
+    } else {
         draw_icon_redo_review(ctx, GPoint(ax, btn_up_y(bounds)), ACTION_ICON_COLOR);
+        draw_icon_checkmark(ctx, GPoint(ax, btn_select_y(bounds)), ACTION_ICON_COLOR);
+        draw_icon_add_record(ctx, GPoint(ax, btn_down_y(bounds)), ACTION_ICON_COLOR);
     }
-    draw_icon_checkmark(ctx, GPoint(ax, btn_select_y(bounds)), ACTION_ICON_COLOR);
 }
 
 // Start dictation. `quick` marks the note the Quick Launch gesture started
@@ -1295,50 +1379,54 @@ static void confirm_redo_cb(void *ctx) {
     start_dictation(s_quick_note);   // redoing a quick-launched note keeps its behaviour
 }
 
+static void confirm_add_cb(void *ctx) {
+    s_is_followup = s_confirm_is_followup;
+    s_dictation_adds = true;
+    start_dictation(s_quick_note);
+}
+
 static void confirm_select_click(ClickRecognizerRef rec, void *ctx) {
+    if (s_confirm_scroll_mode) {
+        confirm_set_scroll_mode(false);
+        return;
+    }
     window_stack_pop(true);
     app_timer_register(50, confirm_route_cb, NULL);
 }
 
-// After the note scrolls back to the top, the next UP would redo the dictation
-// (and drop this transcript), so a quick extra press while scrolling up is
-// ignored.
-#define CONFIRM_REDO_GUARD_MS 500
-
-static void confirm_redo_guard_cb(void *ctx) {
-    s_confirm_redo_guard = NULL;
+static void confirm_select_long_click(ClickRecognizerRef rec, void *ctx) {
+    if (s_confirm_overflows) confirm_set_scroll_mode(!s_confirm_scroll_mode);
 }
 
-// Called for every step of a scroll animation. Track the offset for UP and the
-// action bar's redo icon; arm the guard when a scroll lands on the top.
-static void confirm_offset_changed(ScrollLayer *scroll_layer, void *ctx) {
-    int16_t offset = -scroll_layer_get_content_offset(scroll_layer).y;
-    if (offset == s_confirm_scroll_offset) return;
-    if (offset == 0) {
-        if (s_confirm_redo_guard) app_timer_cancel(s_confirm_redo_guard);
-        s_confirm_redo_guard = app_timer_register(CONFIRM_REDO_GUARD_MS,
-                                                  confirm_redo_guard_cb, NULL);
-    }
-    s_confirm_scroll_offset = offset;
-    if (s_confirm_canvas_layer) layer_mark_dirty(s_confirm_canvas_layer);
-}
-
-// Replaces the ScrollLayer's UP: scroll as it would, except at the top where
-// UP redoes the dictation. DOWN stays the ScrollLayer's own.
+// UP/DOWN replace the ScrollLayer's own (repeating) handlers: in scroll mode
+// they hand over to them; otherwise a press redoes or adds, and a held button's
+// repeats are ignored.
 static void confirm_up_click(ClickRecognizerRef rec, void *ctx) {
-    if (s_confirm_scroll_offset > 0) {
+    if (s_confirm_scroll_mode) {
         scroll_layer_scroll_up_click_handler(rec, s_confirm_scroll_layer);
         return;
     }
-    if (s_confirm_redo_guard) return;
+    if (click_recognizer_is_repeating(rec)) return;
     window_stack_pop(true);
     app_timer_register(300, confirm_redo_cb, NULL);
+}
+
+static void confirm_down_click(ClickRecognizerRef rec, void *ctx) {
+    if (s_confirm_scroll_mode) {
+        scroll_layer_scroll_down_click_handler(rec, s_confirm_scroll_layer);
+        return;
+    }
+    if (click_recognizer_is_repeating(rec)) return;
+    window_stack_pop(true);
+    app_timer_register(300, confirm_add_cb, NULL);
 }
 
 // Runs after the ScrollLayer has set up UP/DOWN (see confirm_window_load).
 static void confirm_click_config(void *ctx) {
     window_single_click_subscribe(BUTTON_ID_SELECT, confirm_select_click);
-    window_single_click_subscribe(BUTTON_ID_UP,     confirm_up_click);
+    window_long_click_subscribe(BUTTON_ID_SELECT, 0, confirm_select_long_click, NULL);
+    window_single_repeating_click_subscribe(BUTTON_ID_UP,   100, confirm_up_click);
+    window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 100, confirm_down_click);
 }
 
 static void confirm_window_load(Window *window) {
@@ -1370,14 +1458,13 @@ static void confirm_window_load(Window *window) {
     // The note scrolls (UP/DOWN) between the title and the pinned destination
     // lines; confirm_relayout_meta() sizes the view once those are placed.
     GRect note_frame = confirm_column(b, STATUS_H + 4, b.size.h - STATUS_H - 8);
-    s_confirm_scroll_offset = 0;
+    s_confirm_scroll_mode = false;
     s_confirm_scroll_layer = scroll_layer_create(note_frame);
     scroll_layer_set_shadow_hidden(s_confirm_scroll_layer, true);
-    // The ScrollLayer drives UP/DOWN; our provider adds SELECT and replaces UP.
+    // The ScrollLayer sets up UP/DOWN; our provider adds SELECT and wraps both.
     scroll_layer_set_click_config_onto_window(s_confirm_scroll_layer, window);
     scroll_layer_set_callbacks(s_confirm_scroll_layer, (ScrollLayerCallbacks) {
-        .click_config_provider          = confirm_click_config,
-        .content_offset_changed_handler = confirm_offset_changed,
+        .click_config_provider = confirm_click_config,
     });
     layer_add_child(root, scroll_layer_get_layer(s_confirm_scroll_layer));
 
@@ -1394,6 +1481,16 @@ static void confirm_window_load(Window *window) {
     text_layer_enable_screen_text_flow_and_paging(s_confirm_content_layer, 4);
     scroll_layer_set_paging(s_confirm_scroll_layer, true);
 #endif
+
+    // How to scroll, shown above the destination when the note overflows.
+    s_confirm_hint_layer = text_layer_create(confirm_column(b, 0, CONFIRM_HINT_H));
+    text_layer_set_background_color(s_confirm_hint_layer, GColorClear);
+    text_layer_set_text_color(s_confirm_hint_layer, GColorLightGray);
+    text_layer_set_font(s_confirm_hint_layer, app_font(AF_FOOTER));
+    text_layer_set_text_alignment(s_confirm_hint_layer, CONFIRM_TEXT_ALIGN);
+    text_layer_set_text(s_confirm_hint_layer, "Hold SELECT to scroll");
+    layer_set_hidden(text_layer_get_layer(s_confirm_hint_layer), true);
+    layer_add_child(root, text_layer_get_layer(s_confirm_hint_layer));
 
     // Destination ("→ Google Tasks") + any extracted due date/time below it.
     snprintf(s_confirm_target_buf, sizeof(s_confirm_target_buf), "\xe2\x86\x92 ?");
@@ -1432,6 +1529,7 @@ static void confirm_window_load(Window *window) {
 #endif
 
     confirm_relayout_meta(b);
+    confirm_set_scroll_mode(false);   // hint text for the laid-out width
 
     s_confirm_open = true;
 }
@@ -1442,7 +1540,7 @@ static void confirm_window_unload(Window *window) {
     text_layer_destroy(s_confirm_title_layer); s_confirm_title_layer = NULL;
     text_layer_destroy(s_confirm_content_layer); s_confirm_content_layer = NULL;
     scroll_layer_destroy(s_confirm_scroll_layer); s_confirm_scroll_layer = NULL;
-    if (s_confirm_redo_guard) { app_timer_cancel(s_confirm_redo_guard); s_confirm_redo_guard = NULL; }
+    text_layer_destroy(s_confirm_hint_layer);    s_confirm_hint_layer    = NULL;
     text_layer_destroy(s_confirm_target_layer);  s_confirm_target_layer  = NULL;
     text_layer_destroy(s_confirm_due_layer);     s_confirm_due_layer     = NULL;
     s_confirm_open = false;
@@ -2619,15 +2717,16 @@ static void init(void) {
     app_message_register_inbox_received(inbox_received_callback);
     app_message_register_inbox_dropped(inbox_dropped_callback);
     app_message_register_outbox_failed(outbox_failed_callback);
-    app_message_open(512, 512);
+    // Outbox carries the whole note (NOTE_TEXT) plus a few small keys.
+    app_message_open(512, NOTE_BUF_SIZE + 128);
 
     connection_service_subscribe((ConnectionHandlers) {
         .pebble_app_connection_handler = connection_handler,
     });
 
-    // Dictation session (buffer 400 bytes)
+    // Dictation session (one transcript; notes grow past it by adding more)
     s_dictation_session = dictation_session_create(
-        NOTE_BUF_SIZE, dictation_callback, NULL);
+        DICTATION_BUF_SIZE, dictation_callback, NULL);
     dictation_session_enable_confirmation(s_dictation_session, false);
     dictation_session_enable_error_dialogs(s_dictation_session, true);
 
